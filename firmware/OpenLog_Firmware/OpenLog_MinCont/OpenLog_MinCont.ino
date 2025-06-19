@@ -17,6 +17,8 @@
 
  If you go through the hassle of compiling and loading this firmware you'll benefit from
 
+  2025-06-19 Pete Jansen - copied from OpenLog_Minimal, re-opens file, starts new file every 10 MB, fix power
+            
  */
 
 #define __PROG_TYPES_COMPAT__ //Needed to get SerialPort.h to work in Arduino 1.6.x
@@ -30,11 +32,10 @@
 #include <avr/power.h> //Needed for powering down perihperals such as the ADC/TWI and Timers
 
 #include <SerialPort.h>
-// port 0, 1024 byte RX buffer, 0 byte TX buffer
-SerialPort<0, 1024, 0> NewSerial;
+// port 0, 1024 byte RX buffer, 0 byte TX buffer 1024 does not work
+SerialPort<0, 512, 0> NewSerial;
 
 //Debug turns on (1) or off (0) a bunch of verbose debug statements. Normally use (0)
-//#define DEBUG  1
 #define DEBUG  0
 
 #define SD_CHIP_SELECT 10 //On OpenLog this is pin 10
@@ -56,8 +57,9 @@ const byte stat2 = 13; //This is the SPI LED, indicating SD traffic
 #define ERROR_FILE_OPEN   9
 
 SdFat sd;
+SdFile workingFile;
 
-long setting_uart_speed = 115200;
+long setting_uart_speed = 38400;
 
 //Handle errors by printing the error type and blinking LEDs in certain way
 //The function will never exit - it loops forever inside blinkError
@@ -67,19 +69,19 @@ void systemError(byte errorType)
   switch (errorType)
   {
     case ERROR_CARD_INIT:
-      NewSerial.print(F("card.init"));
+      NewSerial.println(F("card.init"));
       blinkError(ERROR_SD_INIT);
       break;
     case ERROR_VOLUME_INIT:
-      NewSerial.print(F("volume.init"));
+      NewSerial.println(F("volume.init"));
       blinkError(ERROR_SD_INIT);
       break;
     case ERROR_ROOT_INIT:
-      NewSerial.print(F("root.init"));
+      NewSerial.println(F("root.init"));
       blinkError(ERROR_SD_INIT);
       break;
     case ERROR_FILE_OPEN:
-      NewSerial.print(F("file.open"));
+      NewSerial.println(F("file.open"));
       blinkError(ERROR_SD_INIT);
       break;
   }
@@ -106,15 +108,17 @@ void setup(void)
 
   //Setup UART
   NewSerial.begin(setting_uart_speed);
+  NewSerial.println(F("openlog " __FILE__ " " __DATE__ " " __TIME__ ));
+
   NewSerial.print(F("1"));
 
   //Setup SD & FAT
   if (!sd.begin(SD_CHIP_SELECT, SPI_FULL_SPEED)) systemError(ERROR_CARD_INIT);
 
-  NewSerial.print(F("2"));
+  NewSerial.println(F("2"));
 
 #if DEBUG
-  NewSerial.print(F("\n\nFreeStack: "));
+  NewSerial.print(F("\nFreeStack: "));
   NewSerial.println(FreeStack());
 #endif
 
@@ -134,8 +138,6 @@ char* newLog(void)
   byte msb, lsb;
   unsigned int newFileNumber;
 
-  SdFile newFile; //This will contain the file for SD writing
-
   //Combine two 8-bit EEPROM spots into one 16-bit number
   lsb = EEPROM.read(LOCATION_FILE_NUMBER_LSB);
   msb = EEPROM.read(LOCATION_FILE_NUMBER_MSB);
@@ -152,6 +154,9 @@ char* newLog(void)
     EEPROM.write(LOCATION_FILE_NUMBER_LSB, 0x00);
     EEPROM.write(LOCATION_FILE_NUMBER_MSB, 0x00);
   }
+
+  NewSerial.print(F("newlog # "));
+  NewSerial.println(newFileNumber);
 
   //The above code looks like it will forever loop if we ever create 65535 logs
   //Let's quit if we ever get to 65534
@@ -171,19 +176,33 @@ char* newLog(void)
   {
     sprintf_P(newFileName, PSTR("LOG%05d.TXT"), newFileNumber); //Splice the new file number into this file name
 
-    //If we are able to create this file, then it didn't exist, we're good, break
-    if (newFile.open(newFileName, O_CREAT | O_EXCL | O_WRITE)) break;
-
-    //If file exists, see if empty. If so, use it.
-    if (newFile.open(newFileName, O_READ))
+    if (sd.exists(newFileName))
     {
-      if (newFile.fileSize() == 0)
+      NewSerial.print(F("file exists "));
+      NewSerial.println(newFileName);
+
+      NewSerial.println(F("open existing"));      
+      
+      //If file exists, use it if less than 10 MB
+      if (workingFile.open(newFileName, O_READ))
       {
-        newFile.close();        // Close this existing file we just opened.
-        return (newFileName); // Use existing empty file.
+        NewSerial.print(F("File Size = "));
+        NewSerial.println(workingFile.fileSize());
+
+        if (workingFile.fileSize() < (10*1024*1024L))
+        {
+          NewSerial.println(F("Using file"));
+          workingFile.close();        // Close this existing file we just opened.
+          return (newFileName); // use the existing file
+        }
+        workingFile.close(); // Close this existing file we just opened.
       }
-      newFile.close(); // Close this existing file we just opened.
     }
+    NewSerial.print(F("newLog - open "));
+    NewSerial.println(newFileName);
+
+    //If we are able to create this file, then it didn't exist, we're good, break
+    if (workingFile.open(newFileName, O_CREAT | O_EXCL | O_WRITE)) break;
 
     //Try the next number
     newFileNumber++;
@@ -192,9 +211,11 @@ char* newLog(void)
       NewSerial.print(F("!Too many logs:2!"));
       return (0); //Bail!
     }
+    delay(500);
   }
+  workingFile.close();
 
-  newFileNumber++; //Increment so the next power up uses the next file #
+  NewSerial.println(F("save number"));
 
   //Record new_file number to EEPROM
   lsb = (byte)(newFileNumber & 0x00FF);
@@ -222,7 +243,6 @@ char* newLog(void)
 //Returns 1 on success
 byte appendFile(char* fileName)
 {
-  SdFile workingFile;
 
   // O_CREAT - create the file if it does not exist
   // O_APPEND - seek to the end of the file prior to each write
@@ -260,9 +280,9 @@ byte appendFile(char* fileName)
       toggleLED(stat1); //Toggle the STAT1 LED each time we record the buffer
 
       workingFile.write(buff, charsToRecord);
-    }
 
-    //No characters recevied?
+      lastSyncTime = millis(); //Reset the last sync time to now
+    }
     else if ( (unsigned long)(millis() - lastSyncTime) > MAX_IDLE_TIME_MSEC) //If we haven't received any characters in 2s, goto sleep
     {
       workingFile.sync(); //Sync the card before we go to sleep
